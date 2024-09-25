@@ -761,3 +761,11 @@ fn test_enum_untagged() {
         assert_eq!(expected, deserialized);
     }
 }
+
+#[cfg(feature = "spanned")]
+fn test_spanned() {
+    use serde_spanned::Spanned;
+    let spanned: Spanned<i32> = serde_yaml_ng::from_str("123").unwrap();
+    assert_eq!(spanned.span(), 0..3);
+    assert_eq!(spanned.into_inner(), 123);
+}
