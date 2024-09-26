@@ -15,10 +15,6 @@ use std::num::ParseIntError;
 use std::str;
 use std::sync::Arc;
 
-#[cfg(feature = "spanned")]
-use serde_spanned::__unstable as spanned;
-
-
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A structure that deserializes YAML into Rust values.
@@ -1720,61 +1716,95 @@ impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 
         V: Visitor<'de>,
     {
         use de::IntoDeserializer as _;
+        use serde_spanned::__unstable as spanned;
 
-        struct SpannedDeserializer<'de, T> {
-            phantom_data: std::marker::PhantomData<&'de ()>,
-            start: Option<usize>,
-            end: Option<usize>,
-            value: Option<T>
+        trait PositionAware {
+            fn pos(&self) -> usize;
         }
 
-        impl<'de, T> de::MapAccess<'de> for SpannedDeserializer<'de, T>
+        struct CursorBasedSpannedDeserializer<'a, D> {
+            deserializer: &'a mut D,
+            start_emitted: bool,
+            value_emitted: bool,
+            end_emitted: bool,
+        }
+
+        impl<'a, D> CursorBasedSpannedDeserializer<'a, D> {
+            fn new(deserializer: &'a mut D) -> Self {
+                Self {
+                    deserializer,
+                    start_emitted: false,
+                    value_emitted: false,
+                    end_emitted: false,
+                }
+            }
+        }
+
+        impl PositionAware for DeserializerFromEvents<'_, '_> {
+            fn pos(&self) -> usize {
+                *self.pos
+            }
+        }
+
+        impl<'de, 'a, D> de::MapAccess<'de> for CursorBasedSpannedDeserializer<'a, D>
         where
-            T: de::IntoDeserializer<'de, Error>
+            D: PositionAware,
+            &'a mut D: de::Deserializer<'de>,
         {
-            type Error = Error;
+            type Error = <&'a mut D as de::Deserializer<'de>>::Error;
 
             fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
             where
                 K: de::DeserializeSeed<'de>,
             {
-                if self.start.is_some() {
-                    seed.deserialize(spanned::START_FIELD.into_deserializer()).map(Some)
-                } else if self.end.is_some() {
-                    seed.deserialize(spanned::END_FIELD.into_deserializer()).map(Some)
-                } else if self.value.is_some() {
-                    seed.deserialize(spanned::VALUE_FIELD.into_deserializer()).map(Some)
-                } else {
-                    Ok(None)
+                if !self.start_emitted {
+                    return seed
+                        .deserialize(spanned::START_FIELD.into_deserializer())
+                        .map(Some);
                 }
+
+                if !self.value_emitted {
+                    return seed
+                        .deserialize(spanned::VALUE_FIELD.into_deserializer())
+                        .map(Some);
+                }
+
+                if !self.end_emitted {
+                    return seed
+                        .deserialize(spanned::END_FIELD.into_deserializer())
+                        .map(Some);
+                }
+
+                Ok(None)
             }
 
             fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
             where
                 V: de::DeserializeSeed<'de>,
             {
-                if let Some(start) = self.start.take() {
-                    seed.deserialize(start.into_deserializer())
-                } else if let Some(end) = self.end.take() {
-                    seed.deserialize(end.into_deserializer())
-                } else if let Some(value) = self.value.take() {
-                    seed.deserialize(value.into_deserializer())
-                } else {
-                    panic!("next_value_seed called after end of map")
+                if !self.start_emitted {
+                    self.start_emitted = true;
+                    let pos = self.deserializer.pos();
+                    return seed.deserialize(pos.into_deserializer());
                 }
+
+                if !self.value_emitted {
+                    self.value_emitted = true;
+                    return seed.deserialize(&mut *self.deserializer);
+                }
+
+                if !self.end_emitted {
+                    self.end_emitted = true;
+                    let pos = self.deserializer.pos();
+                    return seed.deserialize(pos.into_deserializer());
+                }
+
+                panic!("next_value_seed called after end of map")
             }
         }
 
         if spanned::is_spanned(name, fields) {
-            let start = *self.pos;
-            let value = self.deserialize_any(/* what to put here? */)?;
-            let end = *self.pos;
-            let deserializer = SpannedDeserializer {
-                phantom_data: std::marker::PhantomData,
-                start: Some(start),
-                end: Some(end),
-                value: Some(value),
-            };
+            let deserializer = CursorBasedSpannedDeserializer::new(self);
             return visitor.visit_map(deserializer);
         }
 
